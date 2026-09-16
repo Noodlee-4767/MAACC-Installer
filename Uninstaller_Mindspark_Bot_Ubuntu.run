@@ -1,0 +1,120 @@
+#!/bin/bash
+set -eu
+
+APP_NAME="Mindspark Bot"
+BASE="$HOME/.local/share/mindspark-bot"
+STATE_DIR="$HOME/.local/state/mindspark-bot"
+FONT_DIR="$HOME/.local/share/fonts/mindspark-bot"
+CACHE_DIR="$HOME/.cache/mindspark-bot"
+APPLICATIONS="$HOME/.local/share/applications"
+ICONS="$HOME/.local/share/icons/hicolor/scalable/apps"
+
+show_error() {
+    if command -v zenity >/dev/null 2>&1; then
+        zenity --error --title="$APP_NAME Uninstaller" --width=520 --text="$1" || true
+    elif command -v notify-send >/dev/null 2>&1; then
+        notify-send -u critical "$APP_NAME Uninstaller" "$1" || true
+    fi
+}
+
+show_done() {
+    if command -v zenity >/dev/null 2>&1; then
+        zenity --info --title="$APP_NAME Uninstaller" --width=500 --text="$1" || true
+    elif command -v notify-send >/dev/null 2>&1; then
+        notify-send "$APP_NAME Uninstaller" "$1" || true
+    fi
+}
+
+[ "$(id -u)" -ne 0 ] || {
+    show_error "Run this uninstaller as the normal Ubuntu user who installed Mindspark Bot, without sudo."
+    exit 1
+}
+[ -n "${HOME:-}" ] && [ "$HOME" != "/" ] || {
+    show_error "The user home folder could not be identified safely. Nothing was removed."
+    exit 1
+}
+
+if command -v zenity >/dev/null 2>&1; then
+    zenity --question --title="$APP_NAME Uninstaller" --width=540 \
+        --ok-label="Remove Mindspark Bot" --cancel-label="Cancel" \
+        --text="This will completely remove Mindspark Bot for this Ubuntu user.\n\nIt removes the bot, updater, private Python dependencies, app-local Chrome fallback, shortcuts, icons, logs, fonts, backups and installer state.\n\nUbuntu system packages shared with other applications will remain installed. Continue?" || exit 0
+fi
+
+# Close only this user's Mindspark Python processes whose command line points
+# at the known application directory. Do not match a generic Python process.
+python3 - "$BASE" <<'PY' 2>/dev/null || true
+import os, signal, sys, time
+from pathlib import Path
+base = Path(sys.argv[1]).resolve()
+mine = os.getpid()
+targets = []
+for proc in Path('/proc').iterdir():
+    if not proc.name.isdigit() or int(proc.name) == mine:
+        continue
+    try:
+        if proc.stat().st_uid != os.getuid():
+            continue
+        args = [os.fsdecode(value) for value in (proc / 'cmdline').read_bytes().split(b'\0') if value]
+        if not args or 'python' not in Path(args[0]).name.lower():
+            continue
+        paths = []
+        for value in args[1:]:
+            if value.startswith('-'):
+                continue
+            candidate = Path(value)
+            if not candidate.is_absolute():
+                candidate = (proc / 'cwd').resolve() / candidate
+            try:
+                paths.append(candidate.resolve())
+            except OSError:
+                pass
+        if any(path == base / 'mindspark_bot.py' or path == base / 'launcher.py' for path in paths):
+            targets.append(int(proc.name))
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        pass
+for pid in targets:
+    try: os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError: pass
+deadline = time.time() + 5
+while targets and time.time() < deadline:
+    targets = [pid for pid in targets if Path('/proc', str(pid)).exists()]
+    time.sleep(.1)
+for pid in targets:
+    try: os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError: pass
+PY
+
+# Remove an experimental package-managed Ubuntu installer if it was installed.
+# This never targets the ChromeOS package and never invokes apt autoremove.
+if command -v dpkg-query >/dev/null 2>&1 && dpkg-query -W -f='${Status}' mindspark-bot-ubuntu 2>/dev/null | grep -q 'install ok installed'; then
+    if command -v pkexec >/dev/null 2>&1; then
+        pkexec apt-get remove --purge -y mindspark-bot-ubuntu >/dev/null 2>&1 || {
+            show_error "The package-managed launcher could not be removed. No user data has been deleted; approve the administrator prompt and try again."
+            exit 1
+        }
+    else
+        show_error "A package-managed Mindspark Bot installation exists, but Ubuntu's administrator prompt is unavailable. Nothing was removed."
+        exit 1
+    fi
+fi
+
+# Every recursive target is fixed and checked to be below this user's home.
+case "$BASE" in "$HOME"/*) ;; *) show_error "Unsafe application path. Nothing was removed."; exit 1 ;; esac
+case "$STATE_DIR" in "$HOME"/*) ;; *) show_error "Unsafe state path. Nothing was removed."; exit 1 ;; esac
+case "$FONT_DIR" in "$HOME"/*) ;; *) show_error "Unsafe font path. Nothing was removed."; exit 1 ;; esac
+case "$CACHE_DIR" in "$HOME"/*) ;; *) show_error "Unsafe cache path. Nothing was removed."; exit 1 ;; esac
+
+rm -rf -- "$BASE" "$STATE_DIR" "$FONT_DIR" "$CACHE_DIR"
+rm -f -- \
+    "$APPLICATIONS/mindspark-bot-ubuntu.desktop" \
+    "$APPLICATIONS/mindspark-bot-ubuntu-managed.desktop" \
+    "$APPLICATIONS/mindspark-bot-ubuntu-updater.desktop" \
+    "$ICONS/mindspark-bot.svg" \
+    "$ICONS/mindspark-bot-ubuntu.svg"
+
+command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPLICATIONS" >/dev/null 2>&1 || true
+command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
+command -v fc-cache >/dev/null 2>&1 && fc-cache -f >/dev/null 2>&1 || true
+
+show_done "Mindspark Bot has been completely removed from this Ubuntu user.\n\nShared Ubuntu system packages were kept because other applications may need them."
+exit 0
